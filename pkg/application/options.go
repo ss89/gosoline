@@ -1,6 +1,7 @@
 package application
 
 import (
+	"context"
 	"flag"
 	"github.com/applike/gosoline/pkg/apiserver"
 	"github.com/applike/gosoline/pkg/cfg"
@@ -8,11 +9,14 @@ import (
 	"github.com/applike/gosoline/pkg/fixtures"
 	"github.com/applike/gosoline/pkg/kernel"
 	"github.com/applike/gosoline/pkg/mon"
+	"github.com/applike/gosoline/pkg/net"
 	"github.com/applike/gosoline/pkg/stream"
 	"github.com/applike/gosoline/pkg/tracing"
 	"github.com/pkg/errors"
 	"io"
+	"io/ioutil"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -27,8 +31,13 @@ type kernelSettings struct {
 	KillTimeout time.Duration `cfg:"killTimeout" default:"10s"`
 }
 
+type loggerOutput struct {
+	File string `cfg:"file" default:"/dev/stdout"`
+}
+
 type loggerSettings struct {
 	Level           string                 `cfg:"level" default:"info" validate:"required"`
+	Output          loggerOutput           `cfg:"output"`
 	Format          string                 `cfg:"format" default:"console" validate:"required"`
 	TimestampFormat string                 `cfg:"timestamp_format" default:"15:04:05.000" validate:"required"`
 	Tags            map[string]interface{} `cfg:"tags"`
@@ -243,14 +252,57 @@ func WithLoggerSettingsFromConfig(app *App) {
 		settings := &loggerSettings{}
 		config.UnmarshalKey("mon.logger", settings)
 
+		outputFile, err := getLoggerOutputFile(settings, logger)
+		if err != nil {
+			return err
+		}
+
 		loggerOptions := []mon.LoggerOption{
 			mon.WithLevel(settings.Level),
+			mon.WithOutput(outputFile),
 			mon.WithFormat(settings.Format),
 			mon.WithTimestampFormat(settings.TimestampFormat),
 		}
 
 		return logger.Option(loggerOptions...)
 	})
+}
+
+func getLoggerOutputFile(settings *loggerSettings, logger mon.GosoLog) (io.Writer, error) {
+	filename := settings.Output.File
+
+	regex, err := regexp.Compile("\\w+?://")
+	if err != nil {
+		return nil, err
+	}
+
+	isProtocolPrefixed := regex.Match([]byte(filename))
+	isFileProtocol := strings.Index(filename, "file://") > -1
+	isRemote := isProtocolPrefixed && !isFileProtocol
+	var outputFile io.Writer
+
+	if isRemote {
+		l := logger.WithContext(context.Background()).(mon.GosoLog)
+
+		tmpFile, err := ioutil.TempFile("", "")
+		if err != nil {
+			return nil, err
+		}
+
+		err = l.Option(mon.WithOutput(tmpFile))
+		if err != nil {
+			return nil, err
+		}
+
+		outputFile, err = net.LookupHostDialer(l, filename)()
+	} else {
+		outputFile, err = os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return outputFile, nil
 }
 
 func WithLoggerTagsFromConfig(app *App) {
