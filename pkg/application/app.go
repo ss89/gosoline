@@ -35,29 +35,13 @@ func (a *App) addSetupOption(opt SetupOption) {
 }
 
 func Default(options ...Option) kernel.Kernel {
-	defaults := []Option{
-		WithApiHealthCheck,
-		WithConfigErrorHandlers(defaultErrorHandler),
-		WithConfigFile("./config.dist.yml", "yml"),
-		WithConfigFileFlag,
-		WithConfigEnvKeyReplacer(cfg.DefaultEnvKeyReplacer),
-		WithConfigSanitizers(cfg.TimeSanitizer),
-		WithMetadataServer,
-		WithConsumerMessagesPerRunnerMetrics,
-		WithKernelSettingsFromConfig,
-		WithLoggerApplicationTag,
-		WithLoggerContextFieldsMessageEncoder,
-		WithLoggerContextFieldsResolver(log.ContextLoggerFieldsResolver),
-		WithLoggerHandlersFromConfig,
-		WithLoggerMetricHandler,
-		WithLoggerSentryHandler(log.SentryContextConfigProvider, log.SentryContextEcsMetadataProvider),
-		WithMetricDaemon,
-		WithProducerDaemon,
-		WithTracing,
-		WithUTCClock(true),
-	}
+	options = append(DefaultServiceAppOptions, options...)
 
-	options = append(defaults, options...)
+	return New(options...)
+}
+
+func Cli(options ...Option) kernel.Kernel {
+	options = append(DefaultCliApp, options...)
 
 	return New(options...)
 }
