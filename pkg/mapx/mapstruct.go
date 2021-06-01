@@ -95,13 +95,16 @@ func (m *MapXStruct) doReadZeroAndDefaultValues(target interface{}) (*MapX, *Map
 		if targetField.Type.Kind() == reflect.Slice {
 			zeroValue = reflect.MakeSlice(targetField.Type, 0, 4).Interface()
 			values.Set(cfg, zeroValue)
-			continue
 		}
 
 		if targetField.Type.Kind() == reflect.Map {
 			zeroValue = reflect.MakeMap(targetField.Type).Interface()
 			values.Set(cfg, zeroValue)
 			continue
+		}
+
+		if targetField.Type.Kind() != reflect.Slice {
+			values.Set(cfg, reflect.Zero(targetField.Type).Interface())
 		}
 
 		zeroValue = reflect.Zero(targetField.Type).Interface()

@@ -375,6 +375,7 @@ func (c *config) buildMapStruct(target interface{}) *mapx.MapXStruct {
 		DefaultTag: "default",
 		Casters: []mapx.MapStructCaster{
 			mapx.MapStructDurationCaster,
+			mapx.MapStructSliceCaster,
 			mapx.MapStructTimeCaster,
 		},
 		Decoders: []mapx.MapStructDecoder{

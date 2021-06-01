@@ -684,6 +684,7 @@ func setupMapStructIO(t *testing.T, source interface{}) *mapx.MapXStruct {
 		DefaultTag: "default",
 		Casters: []mapx.MapStructCaster{
 			mapx.MapStructDurationCaster,
+			mapx.MapStructSliceCaster,
 			mapx.MapStructTimeCaster,
 		},
 	})
