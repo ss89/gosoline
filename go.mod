@@ -66,7 +66,7 @@ require (
 	github.com/stretchr/objx v0.2.0
 	github.com/stretchr/testify v1.7.0
 	github.com/thoas/go-funk v0.0.0-20181020164546-fbae87fb5b5c
-	github.com/tidwall/gjson v1.3.0
+	github.com/tidwall/gjson v1.8.1
 	github.com/twitchscience/kinsumer v0.0.0-20201111182439-cd685b6b5f68
 	github.com/vmihailenco/msgpack v4.0.4+incompatible
 	github.com/wsxiaoys/terminal v0.0.0-20160513160801-0940f3fc43a0 // indirect
