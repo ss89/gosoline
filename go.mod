@@ -22,10 +22,8 @@ require (
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cenkalti/backoff/v4 v4.1.1 // indirect
 	github.com/containerd/containerd v1.5.4 // indirect
-	github.com/denisenkom/go-mssqldb v0.0.0-20190313032549-041949b8d268 // indirect
 	github.com/elastic/go-elasticsearch/v7 v7.2.1-0.20190714143206-f1e755531ff4
 	github.com/elliotchance/redismock/v8 v8.6.1
-	github.com/erikstmartin/go-testdb v0.0.0-20160219214506-8d10e4a1bae5 // indirect
 	github.com/fatih/color v1.7.0
 	github.com/getsentry/sentry-go v0.9.0
 	github.com/gin-contrib/cors v0.0.0-20190301062745-f9e10995c85a
@@ -44,9 +42,8 @@ require (
 	github.com/imdario/mergo v0.3.12
 	github.com/jackc/pgx/v4 v4.8.1
 	github.com/jeremywohl/flatten v0.0.0-20190921043622-d936035e55cf
-	github.com/jinzhu/gorm v1.9.2
-	github.com/jinzhu/inflection v0.0.0-20180308033659-04140366298a
-	github.com/jinzhu/now v0.0.0-20181116074157-8ec929ed50c3 // indirect
+	github.com/jinzhu/gorm v1.9.16
+	github.com/jinzhu/inflection v1.0.0
 	github.com/jmoiron/sqlx v1.2.0
 	github.com/jonboulle/clockwork v0.1.0
 	github.com/karlseguin/ccache v0.0.0-20181227155450-692cd618b264
