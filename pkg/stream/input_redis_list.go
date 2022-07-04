@@ -112,8 +112,12 @@ func (i *redisListInput) Stop() {
 
 func (i *redisListInput) runMetricLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
 	for {
+		if i.stopped {
+			return
+		}
 		i.writeListLengthMetric(ctx)
 		<-ticker.C
 	}
