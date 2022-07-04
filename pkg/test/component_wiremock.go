@@ -36,8 +36,8 @@ func (w *wiremockComponent) Start() error {
 	containerName := fmt.Sprintf("gosoline_test_wiremock_%s", w.name)
 
 	err := w.runner.Run(containerName, &containerConfigLegacy{
-		Repository: "rodolpheche/wiremock",
-		Tag:        "2.26.3-alpine",
+		Repository: "wiremock/wiremock",
+		Tag:        "2.33.2",
 		PortBindings: portBindingLegacy{
 			"8080/tcp": fmt.Sprint(w.settings.Port),
 		},

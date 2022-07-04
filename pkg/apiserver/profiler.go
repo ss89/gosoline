@@ -1,9 +1,10 @@
 package apiserver
 
 import (
-	"github.com/gin-gonic/gin"
 	"net/http"
 	"net/http/pprof"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (

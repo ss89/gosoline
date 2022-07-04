@@ -49,7 +49,6 @@ type Repository interface {
 	Delete(ctx context.Context, value ModelBased) error
 	Query(ctx context.Context, qb *QueryBuilder, result interface{}) error
 	Count(ctx context.Context, qb *QueryBuilder, model ModelBased) (int, error)
-
 	GetModelId() string
 	GetModelName() string
 	GetMetadata() Metadata
@@ -175,7 +174,7 @@ func (r *repository) Read(ctx context.Context, id *uint, out ModelBased) error {
 
 func (r *repository) Update(ctx context.Context, value ModelBased) error {
 	if !r.isQueryableModel(value) {
-		return ErrCrossUpdate
+		return fmt.Errorf("%w: %s != %s", ErrCrossUpdate, r.orm.NewScope(value).TableName(), r.GetMetadata().TableName)
 	}
 
 	modelId := r.GetModelId()
