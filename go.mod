@@ -68,7 +68,7 @@ require (
 	github.com/xitongsys/parquet-go v1.4.0
 	github.com/xitongsys/parquet-go-source v0.0.0-20191104003508-ecfa341356a6
 	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
-	golang.org/x/sys v0.0.0-20211007075335-d3039528d8ac
+	golang.org/x/sys v0.5.0
 	google.golang.org/api v0.20.0
 	google.golang.org/protobuf v1.26.0
 	gopkg.in/tomb.v2 v2.0.0-20161208151619-d5d1b5820637
