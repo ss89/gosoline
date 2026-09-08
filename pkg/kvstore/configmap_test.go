@@ -41,7 +41,7 @@ func buildTestableConfigMapStore[T any](t *testing.T, data map[string]string) (c
 		require.NoError(t, err)
 	}
 
-	store, err := kvstore.NewConfigMapKvStore[T](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
+	store, err := kvstore.NewConfigMapKvStoreWithClient[T](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
 		BatchSize: 100,
 	})
 	require.NoError(t, err)
@@ -290,26 +290,26 @@ func TestConfigMapKvStore_EmptyKey(t *testing.T) {
 func TestConfigMapKvStore_ConstructorValidation(t *testing.T) {
 	client := fake.NewSimpleClientset()
 
-	_, err := kvstore.NewConfigMapKvStore[Item](nil, configMapTestNamespace, configMapTestStore, nil)
+	_, err := kvstore.NewConfigMapKvStoreWithClient[Item](nil, configMapTestNamespace, configMapTestStore, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "client is required")
 
-	_, err = kvstore.NewConfigMapKvStore[Item](client, "", configMapTestStore, nil)
+	_, err = kvstore.NewConfigMapKvStoreWithClient[Item](client, "", configMapTestStore, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "namespace must not be empty")
 
-	_, err = kvstore.NewConfigMapKvStore[Item](client, strings.Repeat("n", 64), configMapTestStore, nil)
+	_, err = kvstore.NewConfigMapKvStoreWithClient[Item](client, strings.Repeat("n", 64), configMapTestStore, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds the kubernetes spec name length limit")
 
 	// the configmap name is kvstore-<storeName>, so the store name must fit in
 	// 63 - 7 - 1 = 55 chars
-	_, err = kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, strings.Repeat("s", 56), nil)
+	_, err = kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, strings.Repeat("s", 56), nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds the maximum store name length")
 
 	// nil settings are accepted and defaulted
-	store, err := kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, configMapTestStore, nil)
+	store, err := kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, configMapTestStore, nil)
 	require.NoError(t, err)
 	require.NotNil(t, store)
 }
@@ -374,7 +374,7 @@ func TestConfigMapKvStore_UpdateError(t *testing.T) {
 		return true, nil, fmt.Errorf("api error")
 	})
 
-	store, err := kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
+	store, err := kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
 		BatchSize: 100,
 	})
 	require.NoError(t, err)

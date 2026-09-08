@@ -57,7 +57,7 @@ func buildIntegrationConfigMapStoreWithClient[T any](t *testing.T, settings *kvs
 		require.NoError(t, err)
 	}
 
-	store, err := kvstore.NewConfigMapKvStore[T](client, configMapTestNamespace, configMapTestStore, settings)
+	store, err := kvstore.NewConfigMapKvStoreWithClient[T](client, configMapTestNamespace, configMapTestStore, settings)
 	require.NoError(t, err)
 
 	return t.Context(), store, client
@@ -343,7 +343,7 @@ func TestConfigMapKvStore_Integration_InvalidCombinations(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
+			_, err := kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
 				Compression: compressed,
 				Encoding:    tc.encoding,
 			})
@@ -353,7 +353,7 @@ func TestConfigMapKvStore_Integration_InvalidCombinations(t *testing.T) {
 	}
 
 	// the valid combination is accepted
-	valid, err := kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
+	valid, err := kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
 		Compression: compressed,
 		Encoding:    &kvstore.EncodingSettings{Enabled: true, Format: kvstore.ConfigMapEncodingBase64},
 	})
@@ -362,7 +362,7 @@ func TestConfigMapKvStore_Integration_InvalidCombinations(t *testing.T) {
 
 	// every encoding-only combination is accepted
 	for _, format := range kvstore.SupportedEncodingFormats() {
-		encodingOnly, err := kvstore.NewConfigMapKvStore[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
+		encodingOnly, err := kvstore.NewConfigMapKvStoreWithClient[Item](client, configMapTestNamespace, configMapTestStore, &kvstore.ConfigMapSettings{
 			Encoding: &kvstore.EncodingSettings{Enabled: true, Format: format},
 		})
 		require.NoError(t, err, "format %s", format)

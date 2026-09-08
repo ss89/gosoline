@@ -45,6 +45,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -53,9 +54,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/justtrackio/gosoline/pkg/appctx"
+	"github.com/justtrackio/gosoline/pkg/cfg"
 	"github.com/justtrackio/gosoline/pkg/encoding/json"
 	"github.com/justtrackio/gosoline/pkg/funk"
+	"github.com/justtrackio/gosoline/pkg/log"
 	"github.com/justtrackio/gosoline/pkg/mdl"
 	"github.com/justtrackio/gosoline/pkg/refl"
 )
@@ -96,16 +102,16 @@ var compressionLevels = []int{
 // any encoding itself, so the two concerns stay independently testable.
 type CompressionSettings struct {
 	// Enabled turns compression on or off.
-	Enabled bool
+	Enabled bool `cfg:"enabled"`
 	// Algo selects the compression algorithm. Supported values are listed in
 	// SupportedCompressionAlgos; ConfigMapCompressionGzip is the only one
 	// implemented today.
-	Algo string
+	Algo string `cfg:"algo"`
 	// Level is the algorithm specific compression level. For gzip the valid
 	// values are gzip.NoCompression (0), gzip.BestSpeed (1),
 	// gzip.BestCompression (9) and gzip.DefaultCompression (-1). The level is
 	// only evaluated when Enabled is true and Algo is valid.
-	Level int
+	Level int `cfg:"level"`
 }
 
 // SupportedCompressionAlgos returns the compression algorithms the ConfigMap
@@ -247,11 +253,18 @@ func gunzipBytes(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("can not create gzip reader: %w", err)
 	}
-	defer r.Close()
 
-	out, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("can not gunzip data: %w", err)
+	out, readErr := io.ReadAll(r)
+	// Close after the read so the gzip trailer and checksum are fully
+	// consumed; a truncated or corrupt stream fails here.
+	closeErr := r.Close()
+
+	if readErr != nil {
+		return nil, fmt.Errorf("can not gunzip data: %w", readErr)
+	}
+
+	if closeErr != nil {
+		return nil, fmt.Errorf("can not close gzip reader: %w", closeErr)
 	}
 
 	return out, nil
@@ -281,10 +294,10 @@ const (
 // of the compression layer. The two are independent and composable.
 type EncodingSettings struct {
 	// Enabled turns encoding on or off.
-	Enabled bool
+	Enabled bool `cfg:"enabled"`
 	// Format selects the encoding format. Supported values are listed in
 	// SupportedEncodingFormats.
-	Format string
+	Format string `cfg:"format"`
 }
 
 // SupportedEncodingFormats returns the encoding formats the ConfigMap backed
@@ -502,18 +515,46 @@ func csvDecodeString(raw string) ([]byte, error) {
 
 // ConfigMapSettings carries the settings of a ConfigMap backed KvStore.
 type ConfigMapSettings struct {
-	Namespace string
-	StoreName string
-	// BatchSize is the number of keys handled per chunk in batch operations.
-	BatchSize int
-	// Compression holds the compression settings applied to stored values.
-	// A nil Compression is treated as disabled.
+	Namespace   string
+	StoreName   string
+	BatchSize   int
 	Compression *CompressionSettings
-	// Encoding holds the encoding settings applied to stored values. A nil
-	// Encoding is treated as disabled. When both compression and encoding are
-	// enabled, compression is applied first and encoding on top of the
-	// compressed bytes, and the order is reversed when reading.
-	Encoding *EncodingSettings
+	Encoding    *EncodingSettings
+}
+
+// ConfigMapConfiguration is the configurable representation of the ConfigMap
+// backed KvStore settings, loaded from the "configmap" section of a kvstore's
+// configuration block. Namespace defaults to "default" when not set.
+// Compression and Encoding use value types (the configurable store only
+// populates value, not pointer, nested structs); the NewConfigMapKvStore
+// factory turns them into the nil-means-disabled pointer settings of
+// ConfigMapSettings based on their Enabled flag.
+type ConfigMapConfiguration struct {
+	Namespace   string              `cfg:"namespace" default:"default"`
+	Compression CompressionSettings `cfg:"compression"`
+	Encoding    EncodingSettings    `cfg:"encoding"`
+}
+
+// toSettings converts the configurable value-typed compression and encoding
+// into the nil-means-disabled pointer settings of ConfigMapSettings.
+func (c ConfigMapConfiguration) toSettings(storeName string, batchSize int) *ConfigMapSettings {
+	var compression *CompressionSettings
+	if c.Compression.Enabled {
+		compression = &c.Compression
+	}
+
+	var encoding *EncodingSettings
+	if c.Encoding.Enabled {
+		encoding = &c.Encoding
+	}
+
+	return &ConfigMapSettings{
+		Namespace:   c.Namespace,
+		StoreName:   storeName,
+		BatchSize:   batchSize,
+		Compression: compression,
+		Encoding:    encoding,
+	}
 }
 
 type configMapKvStore[T any] struct {
@@ -525,9 +566,79 @@ type configMapKvStore[T any] struct {
 	mu sync.Mutex
 }
 
-// NewConfigMapKvStore creates a ConfigMap backed KvStore for the given
-// namespace and store name. The ConfigMap is created on first write.
-func NewConfigMapKvStore[T any](client kubernetes.Interface, namespace, storeName string, settings *ConfigMapSettings) (KvStore[T], error) {
+// NewConfigMapKvStore is the ElementFactory of the ConfigMap backed KvStore
+// as used by the configurable store and the chain store. It loads the
+// store specific settings from the "configmap" section of the kvstore's
+// configuration block, builds the kubernetes client and creates the store.
+// The store name is taken from the kvstore name itself. Like the other
+// element factories it returns the store wrapped in a metrics store when
+// metrics are enabled on the passed settings.
+func NewConfigMapKvStore[T any](ctx context.Context, config cfg.Config, logger log.Logger, settings *Settings) (KvStore[T], error) {
+	if reflect.ValueOf(new(T)).Elem().Kind() == reflect.Pointer {
+		return nil, fmt.Errorf("the generic type T should not be a pointer type but is of type %T", *new(T))
+	}
+
+	configuration := ConfigMapConfiguration{}
+	if err := config.UnmarshalKey(fmt.Sprintf("%s.configmap", GetConfigurableKey(settings.Name)), &configuration); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal configmap kvstore configuration for %s: %w", settings.Name, err)
+	}
+
+	client, err := newKubernetesClient(ctx, config, logger, settings.Name)
+	if err != nil {
+		return nil, fmt.Errorf("can not create kubernetes client for configmap kvstore %s: %w", settings.Name, err)
+	}
+
+	store, err := NewConfigMapKvStoreWithClient[T](client, configuration.Namespace, settings.Name, configuration.toSettings(settings.Name, settings.BatchSize))
+	if err != nil {
+		return nil, err
+	}
+
+	return NewMetricStoreWithInterfaces[T](store, settings), nil
+}
+
+// newKubernetesClient is the factory NewConfigMapKvStore uses to build the
+// kubernetes client. It is a variable so tests can replace it with a fake
+// client.
+var newKubernetesClient = provideKubernetesClient
+
+// provideKubernetesClient provides a cached kubernetes clientset. Inside a
+// pod the in cluster configuration is used, outside a pod the kubeconfig is
+// resolved with the standard clientcmd loading rules (KUBECONFIG env var,
+// then ~/.kube/config).
+func provideKubernetesClient(ctx context.Context, _ cfg.Config, logger log.Logger, name string) (kubernetes.Interface, error) {
+	key := fmt.Sprintf("kvstore.configmap.client.%s", name)
+
+	return appctx.Provide(ctx, key, func() (kubernetes.Interface, error) {
+		if restConfig, err := rest.InClusterConfig(); err == nil {
+			logger.Debug(ctx, "creating kubernetes client for configmap kvstore %s from in cluster config", name)
+
+			return kubernetes.NewForConfig(restConfig)
+		}
+
+		restConfig, err := restConfigFromKubeconfig()
+		if err != nil {
+			return nil, fmt.Errorf("can not create kubernetes client config: %w", err)
+		}
+
+		logger.Debug(ctx, "creating kubernetes client for configmap kvstore %s from kubeconfig", name)
+
+		return kubernetes.NewForConfig(restConfig)
+	})
+}
+
+// restConfigFromKubeconfig builds a rest config from the standard kubeconfig
+// loading rules.
+func restConfigFromKubeconfig() (*rest.Config, error) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+
+	return clientConfig.ClientConfig()
+}
+
+// NewConfigMapKvStoreWithClient creates a ConfigMap backed KvStore for the
+// given namespace and store name using the provided client. The ConfigMap is
+// created on first write.
+func NewConfigMapKvStoreWithClient[T any](client kubernetes.Interface, namespace, storeName string, settings *ConfigMapSettings) (KvStore[T], error) {
 	if client == nil {
 		return nil, fmt.Errorf("can not create configmap kvstore: client is required")
 	}
@@ -888,42 +999,54 @@ func (s *configMapKvStore[T]) updateEntry(ctx context.Context, dataKey, raw stri
 func (s *configMapKvStore[T]) updateEntries(ctx context.Context, updates map[string]string) error {
 	existing, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.configMapName(), metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		data := make(map[string]string, len(updates))
-		for k, v := range updates {
-			if v == "" {
-				// nothing to delete from a configmap that does not exist yet
-				continue
-			}
-
-			data[k] = v
-		}
-
-		if len(data) == 0 {
-			return nil
-		}
-
-		if err := checkDataSize(data); err != nil {
-			return err
-		}
-
-		_, err = s.client.CoreV1().ConfigMaps(s.namespace).Create(ctx, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      s.configMapName(),
-				Namespace: s.namespace,
-			},
-			Data: data,
-		}, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("can not create configmap %s/%s: %w", s.namespace, s.configMapName(), err)
-		}
-
-		return nil
+		return s.createConfigMap(ctx, updates)
 	}
 
 	if err != nil {
 		return fmt.Errorf("can not get configmap %s/%s for update: %w", s.namespace, s.configMapName(), err)
 	}
 
+	return s.applyUpdatesToConfigMap(ctx, existing, updates)
+}
+
+// createConfigMap creates the backing ConfigMap from the given updates,
+// skipping empty values which have nothing to delete from a ConfigMap that
+// does not exist yet.
+func (s *configMapKvStore[T]) createConfigMap(ctx context.Context, updates map[string]string) error {
+	data := make(map[string]string, len(updates))
+	for k, v := range updates {
+		if v == "" {
+			continue
+		}
+
+		data[k] = v
+	}
+
+	if len(data) == 0 {
+		return nil
+	}
+
+	if err := checkDataSize(data); err != nil {
+		return err
+	}
+
+	_, err := s.client.CoreV1().ConfigMaps(s.namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      s.configMapName(),
+			Namespace: s.namespace,
+		},
+		Data: data,
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("can not create configmap %s/%s: %w", s.namespace, s.configMapName(), err)
+	}
+
+	return nil
+}
+
+// applyUpdatesToConfigMap applies the given data map updates to an existing
+// ConfigMap using an optimistic update.
+func (s *configMapKvStore[T]) applyUpdatesToConfigMap(ctx context.Context, existing *corev1.ConfigMap, updates map[string]string) error {
 	if existing.Data == nil {
 		existing.Data = make(map[string]string, len(updates))
 	}
@@ -942,7 +1065,7 @@ func (s *configMapKvStore[T]) updateEntries(ctx context.Context, updates map[str
 		return err
 	}
 
-	_, err = s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	_, err := s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, existing, metav1.UpdateOptions{})
 	if apierrors.IsConflict(err) {
 		return fmt.Errorf("can not update configmap %s/%s: concurrent modification, %w", s.namespace, s.configMapName(), err)
 	}

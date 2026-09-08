@@ -87,7 +87,7 @@ func TestNewConfigMapKvStore_CompressionValidation(t *testing.T) {
 	client := fake.NewSimpleClientset()
 
 	// invalid algorithm is rejected before the store is usable
-	_, err := NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err := NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Compression: &CompressionSettings{
 			Enabled: true,
 			Algo:    "zstd",
@@ -98,7 +98,7 @@ func TestNewConfigMapKvStore_CompressionValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid compression algorithm")
 
 	// invalid level is rejected before the store is usable
-	_, err = NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err = NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Compression: &CompressionSettings{
 			Enabled: true,
 			Algo:    ConfigMapCompressionGzip,
@@ -109,7 +109,7 @@ func TestNewConfigMapKvStore_CompressionValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid compression level")
 
 	// disabled compression is accepted even with unset fields
-	_, err = NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err = NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Compression: &CompressionSettings{},
 	})
 	assert.NoError(t, err)

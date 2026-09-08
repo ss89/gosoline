@@ -76,7 +76,7 @@ func TestNewConfigMapKvStore_EncodingValidation(t *testing.T) {
 	client := fake.NewSimpleClientset()
 
 	// unknown format is rejected before the store is usable
-	_, err := NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err := NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Encoding: &EncodingSettings{
 			Enabled: true,
 			Format:  "hex",
@@ -87,7 +87,7 @@ func TestNewConfigMapKvStore_EncodingValidation(t *testing.T) {
 
 	// each supported format is accepted
 	for _, format := range SupportedEncodingFormats() {
-		_, err = NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+		_, err = NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 			Encoding: &EncodingSettings{
 				Enabled: true,
 				Format:  format,
@@ -97,12 +97,12 @@ func TestNewConfigMapKvStore_EncodingValidation(t *testing.T) {
 	}
 
 	// disabled encoding is accepted even with an unset or garbage format
-	_, err = NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err = NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Encoding: &EncodingSettings{},
 	})
 	assert.NoError(t, err)
 
-	_, err = NewConfigMapKvStore[string](client, "test-ns", "test", &ConfigMapSettings{
+	_, err = NewConfigMapKvStoreWithClient[string](client, "test-ns", "test", &ConfigMapSettings{
 		Encoding: &EncodingSettings{
 			Enabled: false,
 			Format:  "garbage",
