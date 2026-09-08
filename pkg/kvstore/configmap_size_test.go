@@ -63,9 +63,7 @@ func TestConfigMapKvStore_SizeComparisonTable(t *testing.T) {
 
 			require.NoError(t, store.Put(ctx, "size", value))
 
-			data := getStoredData(t, client, ctx)
-			stored, ok := data["kvstore-test-size"]
-			require.True(t, ok, "expected the stored entry to be present")
+			stored := getKeyStoredValue(t, client, ctx, "size")
 			assert.Len(t, stored, tc.stored, "documented stored size %d must match the actually stored size", tc.stored)
 
 			// the value must survive the round trip under this configuration
@@ -99,8 +97,7 @@ func TestConfigMapKvStore_SizeComparisonTable_Ordering(t *testing.T) {
 	for name, settings := range stores {
 		ctx, store, client := buildIntegrationConfigMapStore[Item](t, settings, nil)
 		require.NoError(t, store.Put(ctx, "size", value))
-		data := getStoredData(t, client, ctx)
-		clientSizes[name] = len(data["kvstore-test-size"])
+		clientSizes[name] = len(getKeyStoredValue(t, client, ctx, "size"))
 	}
 
 	// the compressible payload shrinks dramatically with gzip + base64

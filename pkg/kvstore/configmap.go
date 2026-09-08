@@ -1,23 +1,34 @@
 package kvstore
 
-// ConfigMapKvStore is a KvStore implementation backed by a single Kubernetes
-// ConfigMap. All values live in the ConfigMap's data map, one entry per key.
+// ConfigMapKvStore is a KvStore implementation backed by Kubernetes
+// ConfigMaps, one ConfigMap per key.
+//
+// Every key is stored in its own dedicated ConfigMap named
+// "kvstore-<storeName>-<keyName>" that holds exactly one data entry (the key
+// name as the data key). Using one ConfigMap per key instead of a single
+// shared ConfigMap removes the noisy-neighbor problem: a value is bounded
+// only by the 1 MiB data limit of its own ConfigMap, not by every other value
+// already stored by the same store. A large value therefore can not push the
+// store past its limit and make unrelated keys unwritable, and writing one
+// large key does not rewrite (and conflict with) the whole object.
 //
 // This implementation is not meant to be used for high-performance caches,
-// but for use-cases that can accept lower sized values and relaxed response
-// times (e.g. metadata refreshes). Every read is a full ConfigMap read and
-// every write is an optimistic update (get + modify + update) of the whole
-// object, so contention and latency are high and the total data size is
-// bounded by the 1 MiB Kubernetes ConfigMap size limit.
+// but for use-cases that can accept relaxed response times (e.g. metadata
+// refreshes). Every read is a ConfigMap read, every write is an optimistic
+// create-or-update of a single object, and listing (EstimateSize) is a
+// ConfigMap list, so latency scales with the number of keys and the
+// Kubernetes API server. Concurrency on a single key is handled by
+// optimistic updates: a lost update surfaces as a conflict error to the
+// caller rather than being retried.
 //
 // # Size comparison for 1kb (1024 byte) of data
 //
-// The table below shows how much of the backing ConfigMap's 1 MiB data budget
+// The table below shows how much of a key's own 1 MiB ConfigMap data budget
 // a single 1kb value occupies per configuration. Sizes are the stored value
 // size in the ConfigMap data map, not including the data key itself. They are
-// verified by TestConfigMapKvStore_SizeComparisonTable against a
-// highly compressible 1024 byte payload, which is representative for the
-// store's intended use-cases:
+// verified by TestConfigMapKvStore_SizeComparisonTable against a highly
+// compressible 1024 byte payload, which is representative for the store's
+// intended use-cases:
 //
 //	Config                          Stored size for 1kb of data
 //	plain (no compression, no encoding)   1024 B
@@ -29,13 +40,13 @@ package kvstore
 //
 // Compression with base64 on top shrinks the compressible payload to well
 // under 10% of its plain size; the encoding-only options never shrink it
-// (base64 grows it, json and csv only add a small framing overhead). The
-// plain size stays well below the 1 MiB (1048576 B) ConfigMap data limit, so
-// even without compression many 1kb values fit into a single ConfigMap.
+// (base64 grows it, json and csv only add a small framing overhead). Because
+// each key owns its ConfigMap, even a plain 1kb value leaves the full 1 MiB
+// (1048576 B) budget of that key's ConfigMap available.
 //
-// The ConfigMap is created on first write. Reads against a ConfigMap that
-// does not exist yet return a clear error, so a missing store is never
-// silently treated as an empty one.
+// A key's ConfigMap is created on first write. Reads and existence checks
+// against a key whose ConfigMap does not exist yet report the key as missing
+// (false), and deleting a key removes its ConfigMap.
 
 import (
 	"bytes"
@@ -48,7 +59,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -67,14 +77,17 @@ import (
 )
 
 const (
-	// ConfigMapKeyPrefix is the fixed prefix of every data key stored in the
-	// backing ConfigMap.
+	// ConfigMapKeyPrefix is the fixed prefix of every ConfigMap name and data
+	// key created by the ConfigMap backed KvStore.
 	ConfigMapKeyPrefix = "kvstore"
 	// ConfigMapMaxKeyLength is the maximum length of Kubernetes spec names
-	// (RFC 1123 labels), which also applies to ConfigMap data keys.
+	// (RFC 1123 labels). It bounds every ConfigMap name this store generates,
+	// keeping each name within a single DNS label so it is safe for all
+	// consumers even though object names could technically be longer.
 	ConfigMapMaxKeyLength = 63
 	// ConfigMapMaxDataSize is the maximum size in bytes of a ConfigMap's data
-	// map as enforced by the Kubernetes API server.
+	// map as enforced by the Kubernetes API server. Because the store uses one
+	// ConfigMap per key, this limit applies to a single key's value.
 	ConfigMapMaxDataSize = 1024 * 1024
 
 	// ConfigMapCompressionGzip is the gzip compression algorithm. It is the
@@ -562,8 +575,6 @@ type configMapKvStore[T any] struct {
 	namespace string
 	storeName string
 	settings  *ConfigMapSettings
-
-	mu sync.Mutex
 }
 
 // NewConfigMapKvStore is the ElementFactory of the ConfigMap backed KvStore
@@ -636,8 +647,8 @@ func restConfigFromKubeconfig() (*rest.Config, error) {
 }
 
 // NewConfigMapKvStoreWithClient creates a ConfigMap backed KvStore for the
-// given namespace and store name using the provided client. The ConfigMap is
-// created on first write.
+// given namespace and store name using the provided client. Each key's
+// ConfigMap is created on first write.
 func NewConfigMapKvStoreWithClient[T any](client kubernetes.Interface, namespace, storeName string, settings *ConfigMapSettings) (KvStore[T], error) {
 	if client == nil {
 		return nil, fmt.Errorf("can not create configmap kvstore: client is required")
@@ -648,7 +659,7 @@ func NewConfigMapKvStoreWithClient[T any](client kubernetes.Interface, namespace
 	}
 
 	if err := validateStoreName(storeName); err != nil {
-		return nil, fmt.Errorf("can not create configmap kvstore: %w", err)
+		return nil, fmt.Errorf("can not create configmap kvstore %q: %w", storeName, err)
 	}
 
 	if settings == nil {
@@ -681,13 +692,22 @@ func NewConfigMapKvStoreWithInterfaces[T any](client kubernetes.Interface, names
 	}
 }
 
-func (s *configMapKvStore[T]) configMapName() string {
-	return fmt.Sprintf("kvstore-%s", s.storeName)
+// configMapName returns the name of the ConfigMap that stores the given key:
+// "kvstore-<storeName>-<keyName>". Each key owns its own ConfigMap.
+func (s *configMapKvStore[T]) configMapName(keyStr string) string {
+	return fmt.Sprintf("%s-%s-%s", ConfigMapKeyPrefix, s.storeName, keyStr)
+}
+
+// dataKey is the key under which the value is stored inside a key's
+// dedicated ConfigMap. The ConfigMap is dedicated to a single key, so the
+// key name itself is the data key.
+func (s *configMapKvStore[T]) dataKey(keyStr string) string {
+	return keyStr
 }
 
 // maxKeyNameLength is the longest keyName that still fits into the full
-// data key "kvstore-<storeName>-<keyName>" within the Kubernetes spec name
-// length limit.
+// ConfigMap name "kvstore-<storeName>-<keyName>" within the Kubernetes spec
+// name length limit.
 func (s *configMapKvStore[T]) maxKeyNameLength() int {
 	return ConfigMapMaxKeyLength - len(ConfigMapKeyPrefix) - 2 - len(s.storeName)
 }
@@ -748,9 +768,9 @@ func (s *configMapKvStore[T]) decodeFromStorage(raw string, value any) error {
 	return nil
 }
 
-// key builds the ConfigMap data key "kvstore-<storeName>-<keyName>" for the
-// given key and rejects keys whose full length exceeds the Kubernetes spec
-// name length limit.
+// key builds and validates the key name for the given key, rejecting empty
+// keys and keys whose resulting ConfigMap name would exceed the Kubernetes
+// spec name length limit.
 func (s *configMapKvStore[T]) key(key any) (string, error) {
 	keyStr, err := CastKeyToString(key)
 	if err != nil {
@@ -764,52 +784,45 @@ func (s *configMapKvStore[T]) key(key any) (string, error) {
 	maxLen := s.maxKeyNameLength()
 	if len(keyStr) > maxLen {
 		return "", fmt.Errorf(
-			"invalid key name %q: length %d exceeds the maximum key name length %d (full data key %q would exceed the kubernetes spec name length limit %d)",
-			keyStr, len(keyStr), maxLen, s.dataKey(keyStr), ConfigMapMaxKeyLength,
+			"invalid key name %q: length %d exceeds the maximum key name length %d (configmap name %q would exceed the kubernetes spec name length limit %d)",
+			keyStr, len(keyStr), maxLen, s.configMapName(keyStr), ConfigMapMaxKeyLength,
 		)
 	}
 
-	return s.dataKey(keyStr), nil
-}
-
-func (s *configMapKvStore[T]) dataKey(keyStr string) string {
-	return fmt.Sprintf("%s-%s-%s", ConfigMapKeyPrefix, s.storeName, keyStr)
+	return keyStr, nil
 }
 
 func (s *configMapKvStore[T]) Contains(ctx context.Context, key any) (bool, error) {
-	dataKey, err := s.key(key)
+	keyStr, err := s.key(key)
 	if err != nil {
-		return false, fmt.Errorf("can not get data key to check value in configmap: %w", err)
+		return false, fmt.Errorf("can not get key to check in configmap: %w", err)
 	}
 
-	data, err := s.readData(ctx)
+	_, found, err := s.readKey(ctx, keyStr)
 	if err != nil {
-		return false, fmt.Errorf("can not check existence of key %s in configmap: %w", dataKey, err)
+		return false, fmt.Errorf("can not check existence of key %s: %w", keyStr, err)
 	}
 
-	_, ok := data[dataKey]
-
-	return ok, nil
+	return found, nil
 }
 
 func (s *configMapKvStore[T]) Get(ctx context.Context, key any, value *T) (bool, error) {
-	dataKey, err := s.key(key)
+	keyStr, err := s.key(key)
 	if err != nil {
-		return false, fmt.Errorf("can not get data key to read value from configmap: %w", err)
+		return false, fmt.Errorf("can not get key to read from configmap: %w", err)
 	}
 
-	data, err := s.readData(ctx)
+	raw, found, err := s.readKey(ctx, keyStr)
 	if err != nil {
-		return false, fmt.Errorf("can not read configmap for key %s: %w", dataKey, err)
+		return false, fmt.Errorf("can not read configmap for key %s: %w", keyStr, err)
 	}
 
-	raw, ok := data[dataKey]
-	if !ok {
+	if !found {
 		return false, nil
 	}
 
 	if err := s.decodeFromStorage(raw, value); err != nil {
-		return false, fmt.Errorf("can not unmarshal value for key %s from configmap: %w", dataKey, err)
+		return false, fmt.Errorf("can not unmarshal value for key %s from configmap: %w", keyStr, err)
 	}
 
 	return true, nil
@@ -820,21 +833,20 @@ func (s *configMapKvStore[T]) GetBatch(ctx context.Context, keys any, values any
 }
 
 func (s *configMapKvStore[T]) getChunk(ctx context.Context, resultMap *refl.Map, keys []any) ([]any, error) {
-	data, err := s.readData(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("can not read configmap for batch: %w", err)
-	}
-
 	missing := make([]any, 0)
 
 	for _, key := range keys {
-		dataKey, err := s.key(key)
+		keyStr, err := s.key(key)
 		if err != nil {
-			return nil, fmt.Errorf("can not build data key for key %T %v: %w", key, key, err)
+			return nil, fmt.Errorf("can not build key for key %T %v: %w", key, key, err)
 		}
 
-		raw, ok := data[dataKey]
-		if !ok {
+		raw, found, err := s.readKey(ctx, keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("can not read configmap for key %s: %w", keyStr, err)
+		}
+
+		if !found {
 			missing = append(missing, key)
 
 			continue
@@ -842,11 +854,11 @@ func (s *configMapKvStore[T]) getChunk(ctx context.Context, resultMap *refl.Map,
 
 		element := resultMap.NewElement()
 		if err := s.decodeFromStorage(raw, element); err != nil {
-			return nil, fmt.Errorf("can not unmarshal value for key %s: %w", dataKey, err)
+			return nil, fmt.Errorf("can not unmarshal value for key %s: %w", keyStr, err)
 		}
 
 		if err := resultMap.Set(key, element); err != nil {
-			return nil, fmt.Errorf("can not set new element on result map for key %s: %w", dataKey, err)
+			return nil, fmt.Errorf("can not set new element on result map for key %s: %w", keyStr, err)
 		}
 	}
 
@@ -854,20 +866,17 @@ func (s *configMapKvStore[T]) getChunk(ctx context.Context, resultMap *refl.Map,
 }
 
 func (s *configMapKvStore[T]) Put(ctx context.Context, key any, value T) error {
-	dataKey, err := s.key(key)
+	keyStr, err := s.key(key)
 	if err != nil {
-		return fmt.Errorf("can not get data key to write value to configmap: %w", err)
+		return fmt.Errorf("can not get key to write value to configmap: %w", err)
 	}
 
 	stored, err := s.encodeForStorage(value)
 	if err != nil {
-		return fmt.Errorf("can not prepare value for key %s: %w", dataKey, err)
+		return fmt.Errorf("can not prepare value for key %s: %w", keyStr, err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.updateEntry(ctx, dataKey, stored)
+	return s.writeKey(ctx, keyStr, stored)
 }
 
 func (s *configMapKvStore[T]) PutBatch(ctx context.Context, values any) error {
@@ -880,42 +889,44 @@ func (s *configMapKvStore[T]) PutBatch(ctx context.Context, values any) error {
 		return nil
 	}
 
-	updates := make(map[string]string, len(mii))
+	// Encode every value up front so a single bad value fails the whole batch
+	// before any ConfigMap is touched.
+	stored := make(map[string]string, len(mii))
 	for k, v := range mii {
-		dataKey, err := s.key(k)
+		keyStr, err := s.key(k)
 		if err != nil {
-			return fmt.Errorf("can not get data key to write value to configmap: %w", err)
+			return fmt.Errorf("can not get key to write value to configmap: %w", err)
 		}
 
 		raw, err := Marshal(v)
 		if err != nil {
-			return fmt.Errorf("can not marshal value for key %s: %w", dataKey, err)
+			return fmt.Errorf("can not marshal value for key %s: %w", keyStr, err)
 		}
 
-		stored, err := s.prepareStoredBytes(raw)
+		encoded, err := s.prepareStoredBytes(raw)
 		if err != nil {
-			return fmt.Errorf("can not prepare value for key %s: %w", dataKey, err)
+			return fmt.Errorf("can not prepare value for key %s: %w", keyStr, err)
 		}
 
-		updates[dataKey] = stored
+		stored[keyStr] = encoded
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for keyStr, encoded := range stored {
+		if err := s.writeKey(ctx, keyStr, encoded); err != nil {
+			return fmt.Errorf("can not write key %s to configmap: %w", keyStr, err)
+		}
+	}
 
-	return s.updateEntries(ctx, updates)
+	return nil
 }
 
 func (s *configMapKvStore[T]) Delete(ctx context.Context, key any) error {
-	dataKey, err := s.key(key)
+	keyStr, err := s.key(key)
 	if err != nil {
-		return fmt.Errorf("can not get data key to delete value from configmap: %w", err)
+		return fmt.Errorf("can not get key to delete value from configmap: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.updateEntry(ctx, dataKey, "")
+	return s.deleteKey(ctx, keyStr)
 }
 
 func (s *configMapKvStore[T]) DeleteBatch(ctx context.Context, keys any) error {
@@ -924,154 +935,156 @@ func (s *configMapKvStore[T]) DeleteBatch(ctx context.Context, keys any) error {
 		return fmt.Errorf("could not convert keys from %T to []any: %w", keys, err)
 	}
 
-	dataKeys := make(map[string]struct{}, len(si))
+	seen := make(map[string]struct{}, len(si))
 	for _, key := range si {
-		dataKey, err := s.key(key)
+		keyStr, err := s.key(key)
 		if err != nil {
-			return fmt.Errorf("can not get data key to delete value from configmap: %w", err)
+			return fmt.Errorf("can not get key to delete value from configmap: %w", err)
 		}
 
-		dataKeys[dataKey] = struct{}{}
+		seen[keyStr] = struct{}{}
 	}
 
-	if len(dataKeys) == 0 {
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for dataKey := range dataKeys {
-		if err := s.updateEntry(ctx, dataKey, ""); err != nil {
-			return fmt.Errorf("can not delete key %s from configmap: %w", dataKey, err)
+	for keyStr := range seen {
+		if err := s.deleteKey(ctx, keyStr); err != nil {
+			return fmt.Errorf("can not delete key %s from configmap: %w", keyStr, err)
 		}
 	}
 
 	return nil
 }
 
-// EstimateSize returns the number of kvstore entries currently stored in the
-// backing ConfigMap.
+// EstimateSize returns the number of keys currently stored, i.e. the number
+// of ConfigMaps in the namespace named "kvstore-<storeName>-*".
 func (s *configMapKvStore[T]) EstimateSize() *int64 {
-	data, err := s.readData(context.Background())
+	size, err := s.countConfigMaps(context.Background())
 	if err != nil {
 		return nil
-	}
-
-	prefix := s.dataKey("")
-	size := int64(0)
-	for dataKey := range data {
-		if strings.HasPrefix(dataKey, prefix) {
-			size++
-		}
 	}
 
 	return mdl.Box(size)
 }
 
-// readData returns the data map of the backing ConfigMap. A missing
-// ConfigMap is returned as a clear error, all other API errors are wrapped.
-func (s *configMapKvStore[T]) readData(ctx context.Context) (map[string]string, error) {
-	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.configMapName(), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("configmap %s/%s not found", s.namespace, s.configMapName())
-	}
-
+// countConfigMaps lists the ConfigMaps in the namespace and counts the ones
+// that belong to this store (name prefix "kvstore-<storeName>-").
+func (s *configMapKvStore[T]) countConfigMaps(ctx context.Context) (int64, error) {
+	configMaps, err := s.client.CoreV1().ConfigMaps(s.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("can not get configmap %s/%s: %w", s.namespace, s.configMapName(), err)
+		return 0, fmt.Errorf("can not list configmaps in namespace %s: %w", s.namespace, err)
 	}
 
-	if cm.Data == nil {
-		return map[string]string{}, nil
-	}
-
-	return cm.Data, nil
-}
-
-// updateEntry writes (or removes, if raw is empty) a single entry into the
-// backing ConfigMap using an optimistic update.
-func (s *configMapKvStore[T]) updateEntry(ctx context.Context, dataKey, raw string) error {
-	return s.updateEntries(ctx, map[string]string{dataKey: raw})
-}
-
-// updateEntries applies the given data map updates to the backing ConfigMap
-// using an optimistic update. Callers must hold s.mu.
-func (s *configMapKvStore[T]) updateEntries(ctx context.Context, updates map[string]string) error {
-	existing, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.configMapName(), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return s.createConfigMap(ctx, updates)
-	}
-
-	if err != nil {
-		return fmt.Errorf("can not get configmap %s/%s for update: %w", s.namespace, s.configMapName(), err)
-	}
-
-	return s.applyUpdatesToConfigMap(ctx, existing, updates)
-}
-
-// createConfigMap creates the backing ConfigMap from the given updates,
-// skipping empty values which have nothing to delete from a ConfigMap that
-// does not exist yet.
-func (s *configMapKvStore[T]) createConfigMap(ctx context.Context, updates map[string]string) error {
-	data := make(map[string]string, len(updates))
-	for k, v := range updates {
-		if v == "" {
-			continue
+	prefix := fmt.Sprintf("%s-%s-", ConfigMapKeyPrefix, s.storeName)
+	size := int64(0)
+	for _, configMap := range configMaps.Items {
+		if strings.HasPrefix(configMap.Name, prefix) {
+			size++
 		}
-
-		data[k] = v
 	}
 
-	if len(data) == 0 {
-		return nil
+	return size, nil
+}
+
+// readKey reads the stored value of the given key from its dedicated
+// ConfigMap. A key whose ConfigMap does not exist yet is reported as missing
+// (ok false, no error) so an absent key is never treated as a store error.
+func (s *configMapKvStore[T]) readKey(ctx context.Context, keyStr string) (string, bool, error) {
+	name := s.configMapName(keyStr)
+
+	configMap, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", false, nil
 	}
+
+	if err != nil {
+		return "", false, fmt.Errorf("can not get configmap %s/%s: %w", s.namespace, name, err)
+	}
+
+	if configMap.Data == nil {
+		return "", false, nil
+	}
+
+	raw, ok := configMap.Data[s.dataKey(keyStr)]
+	if !ok {
+		return "", false, nil
+	}
+
+	return raw, true, nil
+}
+
+// writeKey stores the given encoded value under the given key in its
+// dedicated ConfigMap, creating the ConfigMap on first write. A concurrent
+// modification surfaces as a conflict error to the caller.
+func (s *configMapKvStore[T]) writeKey(ctx context.Context, keyStr, stored string) error {
+	name := s.configMapName(keyStr)
+	dataKey := s.dataKey(keyStr)
+	data := map[string]string{dataKey: stored}
 
 	if err := checkDataSize(data); err != nil {
 		return err
 	}
 
-	_, err := s.client.CoreV1().ConfigMaps(s.namespace).Create(ctx, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      s.configMapName(),
-			Namespace: s.namespace,
-		},
-		Data: data,
-	}, metav1.CreateOptions{})
+	existing, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return s.createKeyConfigMap(ctx, name, data)
+	}
+
 	if err != nil {
-		return fmt.Errorf("can not create configmap %s/%s: %w", s.namespace, s.configMapName(), err)
+		return fmt.Errorf("can not get configmap %s/%s for update: %w", s.namespace, name, err)
+	}
+
+	if existing.Data == nil {
+		existing.Data = make(map[string]string, 1)
+	}
+
+	existing.Data[dataKey] = stored
+
+	_, err = s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	if apierrors.IsConflict(err) {
+		return fmt.Errorf("can not update configmap %s/%s: concurrent modification, %w", s.namespace, name, err)
+	}
+
+	if err != nil {
+		return fmt.Errorf("can not update configmap %s/%s: %w", s.namespace, name, err)
 	}
 
 	return nil
 }
 
-// applyUpdatesToConfigMap applies the given data map updates to an existing
-// ConfigMap using an optimistic update.
-func (s *configMapKvStore[T]) applyUpdatesToConfigMap(ctx context.Context, existing *corev1.ConfigMap, updates map[string]string) error {
-	if existing.Data == nil {
-		existing.Data = make(map[string]string, len(updates))
-	}
-
-	for dataKey, raw := range updates {
-		if raw == "" {
-			delete(existing.Data, dataKey)
-
-			continue
-		}
-
-		existing.Data[dataKey] = raw
-	}
-
-	if err := checkDataSize(existing.Data); err != nil {
-		return err
-	}
-
-	_, err := s.client.CoreV1().ConfigMaps(s.namespace).Update(ctx, existing, metav1.UpdateOptions{})
-	if apierrors.IsConflict(err) {
-		return fmt.Errorf("can not update configmap %s/%s: concurrent modification, %w", s.namespace, s.configMapName(), err)
+// createKeyConfigMap creates the dedicated ConfigMap for a key from the given
+// data. A concurrent create (already exists) is tolerated and re-read, so a
+// lost create does not fail the write.
+func (s *configMapKvStore[T]) createKeyConfigMap(ctx context.Context, name string, data map[string]string) error {
+	_, err := s.client.CoreV1().ConfigMaps(s.namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: s.namespace,
+		},
+		Data: data,
+	}, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("can not create configmap %s/%s: concurrent modification, %w", s.namespace, name, err)
 	}
 
 	if err != nil {
-		return fmt.Errorf("can not update configmap %s/%s: %w", s.namespace, s.configMapName(), err)
+		return fmt.Errorf("can not create configmap %s/%s: %w", s.namespace, name, err)
+	}
+
+	return nil
+}
+
+// deleteKey removes the dedicated ConfigMap of the given key. A key whose
+// ConfigMap does not exist yet is a no-op, so deleting an absent key is not
+// an error.
+func (s *configMapKvStore[T]) deleteKey(ctx context.Context, keyStr string) error {
+	name := s.configMapName(keyStr)
+
+	err := s.client.CoreV1().ConfigMaps(s.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("can not delete configmap %s/%s: %w", s.namespace, name, err)
 	}
 
 	return nil
@@ -1112,8 +1125,8 @@ func validateStoreName(storeName string) error {
 
 	if maxLen := ConfigMapMaxKeyLength - len(ConfigMapKeyPrefix) - 2; len(storeName) > maxLen {
 		return fmt.Errorf(
-			"store name %q exceeds the maximum store name length %d (full configmap name %q would exceed the kubernetes spec name length limit %d)",
-			storeName, maxLen, fmt.Sprintf("kvstore-%s", storeName), ConfigMapMaxKeyLength,
+			"store name %q exceeds the maximum store name length %d (configmap name %q would exceed the kubernetes spec name length limit %d)",
+			storeName, maxLen, fmt.Sprintf("%s-%s", ConfigMapKeyPrefix, storeName), ConfigMapMaxKeyLength,
 		)
 	}
 

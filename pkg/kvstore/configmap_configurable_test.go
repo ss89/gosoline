@@ -74,12 +74,13 @@ func TestNewConfigMapKvStore_Config(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, configMapConfigurableItem{Name: "bar", Age: 42}, got)
 
-	// the value is stored in the backing configmap under the prefixed data key,
-	// compressed and base64 encoded
-	cm, err := client.CoreV1().ConfigMaps("test-ns").Get(t.Context(), "kvstore-mystore", metav1.GetOptions{})
+	// the value is stored in the key's dedicated configmap (named
+	// kvstore-<storeName>-<keyName>) under the key name, compressed and
+	// base64 encoded
+	cm, err := client.CoreV1().ConfigMaps("test-ns").Get(t.Context(), "kvstore-mystore-foo", metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Contains(t, cm.Data, "kvstore-mystore-foo")
-	assert.NotEqual(t, `{"name":"bar","age":42}`, cm.Data["kvstore-mystore-foo"])
+	require.Contains(t, cm.Data, "foo")
+	assert.NotEqual(t, `{"name":"bar","age":42}`, cm.Data["foo"])
 }
 
 func TestNewConfigMapKvStore_ConfigDefaults(t *testing.T) {
@@ -100,9 +101,9 @@ func TestNewConfigMapKvStore_ConfigDefaults(t *testing.T) {
 
 	require.NoError(t, store.Put(t.Context(), "foo", configMapConfigurableItem{Name: "bar", Age: 1}))
 
-	cm, err := client.CoreV1().ConfigMaps("default").Get(t.Context(), "kvstore-mystore", metav1.GetOptions{})
+	cm, err := client.CoreV1().ConfigMaps("default").Get(t.Context(), "kvstore-mystore-foo", metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, `{"name":"bar","age":1}`, cm.Data["kvstore-mystore-foo"])
+	assert.Equal(t, `{"name":"bar","age":1}`, cm.Data["foo"])
 }
 
 func TestConfigMapConfiguration_Unmarshal(t *testing.T) {
@@ -176,8 +177,8 @@ func TestNewConfigurableKvStore_ChainWithConfigMapElement(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, configMapConfigurableItem{Name: "bar", Age: 7}, got)
 
-	// the chain wrote through to the backing configmap
-	cm, err := client.CoreV1().ConfigMaps("test-ns").Get(t.Context(), "kvstore-mystore", metav1.GetOptions{})
+	// the chain wrote through to the key's dedicated configmap
+	cm, err := client.CoreV1().ConfigMaps("test-ns").Get(t.Context(), "kvstore-mystore-foo", metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Contains(t, cm.Data, "kvstore-mystore-foo")
+	assert.Contains(t, cm.Data, "foo")
 }

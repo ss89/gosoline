@@ -22,7 +22,9 @@ import (
 )
 
 // buildIntegrationConfigMapStore creates a ConfigMap backed KvStore on a fake
-// kubernetes client. A non-nil data map pre-seeds the backing ConfigMap.
+// kubernetes client. A non-nil data map pre-seeds dedicated ConfigMaps, one
+// per key: each entry's key becomes both the data key and part of the
+// ConfigMap name "kvstore-<store>-<key>".
 func buildIntegrationConfigMapStore[T any](t *testing.T, settings *kvstore.ConfigMapSettings, data map[string]string) (context.Context, kvstore.KvStore[T], *fake.Clientset) {
 	t.Helper()
 
@@ -31,7 +33,7 @@ func buildIntegrationConfigMapStore[T any](t *testing.T, settings *kvstore.Confi
 
 // buildIntegrationConfigMapStoreWithClient behaves like
 // buildIntegrationConfigMapStore but reuses the given fake client, so
-// multiple store instances can share the same (fake) ConfigMap.
+// multiple store instances can share the same (fake) ConfigMaps.
 func buildIntegrationConfigMapStoreWithClient[T any](t *testing.T, settings *kvstore.ConfigMapSettings, data map[string]string, client *fake.Clientset) (context.Context, kvstore.KvStore[T], *fake.Clientset) {
 	t.Helper()
 
@@ -45,13 +47,13 @@ func buildIntegrationConfigMapStoreWithClient[T any](t *testing.T, settings *kvs
 		client = fake.NewSimpleClientset()
 	}
 
-	if data != nil {
+	for key, value := range data {
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("kvstore-%s", configMapTestStore),
+				Name:      fmt.Sprintf("kvstore-%s-%s", configMapTestStore, key),
 				Namespace: configMapTestNamespace,
 			},
-			Data: data,
+			Data: map[string]string{key: value},
 		}
 		_, err := client.CoreV1().ConfigMaps(configMapTestNamespace).Create(t.Context(), cm, metav1.CreateOptions{})
 		require.NoError(t, err)
@@ -63,14 +65,12 @@ func buildIntegrationConfigMapStoreWithClient[T any](t *testing.T, settings *kvs
 	return t.Context(), store, client
 }
 
-// getStoredData reads the raw data map of the backing ConfigMap.
-func getStoredData(t *testing.T, client *fake.Clientset, ctx context.Context) map[string]string {
+// getKeyStoredValue reads the raw stored value of a key from its dedicated
+// ConfigMap.
+func getKeyStoredValue(t *testing.T, client *fake.Clientset, ctx context.Context, key string) string {
 	t.Helper()
 
-	cm, err := client.CoreV1().ConfigMaps(configMapTestNamespace).Get(ctx, "kvstore-test", metav1.GetOptions{})
-	require.NoError(t, err)
-
-	return cm.Data
+	return getKeyConfigMap(t, client, ctx, key).Data[key]
 }
 
 // gzipLevel1 compresses data with gzip level 1; helper to build the expected
@@ -106,10 +106,8 @@ func TestConfigMapKvStore_Integration_PlainValues(t *testing.T) {
 
 	require.NoError(t, store.Put(ctx, "foo", Item{Id: "foo", Body: "bar"}))
 
-	data := getStoredData(t, client, ctx)
-	assert.Equal(t, map[string]string{
-		"kvstore-test-foo": string(marshalItem(t, Item{Id: "foo", Body: "bar"})),
-	}, data)
+	stored := getKeyStoredValue(t, client, ctx, "foo")
+	assert.Equal(t, string(marshalItem(t, Item{Id: "foo", Body: "bar"})), stored)
 
 	item := &Item{}
 	found, err := store.Get(ctx, "foo", item)
@@ -120,7 +118,7 @@ func TestConfigMapKvStore_Integration_PlainValues(t *testing.T) {
 	// values written before compression/encoding existed must still be
 	// readable by a plain store
 	_, store2, _ := buildIntegrationConfigMapStore[Item](t, &kvstore.ConfigMapSettings{}, map[string]string{
-		"kvstore-test-legacy": string(marshalItem(t, Item{Id: "legacy", Body: "plain json"})),
+		"legacy": string(marshalItem(t, Item{Id: "legacy", Body: "plain json"})),
 	})
 
 	found, err = store2.Get(ctx, "legacy", item)
@@ -147,8 +145,7 @@ func TestConfigMapKvStore_Integration_CompressedBase64(t *testing.T) {
 	value := Item{Id: "foo", Body: strings.Repeat("compressible body ", 250)}
 	require.NoError(t, store.Put(ctx, "foo", value))
 
-	data := getStoredData(t, client, ctx)
-	stored := data["kvstore-test-foo"]
+	stored := getKeyStoredValue(t, client, ctx, "foo")
 	plain := marshalItem(t, value)
 
 	// the stored value is exactly base64(gzip(marshaled value)), not the
@@ -174,8 +171,7 @@ func TestConfigMapKvStore_Integration_JsonEncoding(t *testing.T) {
 	value := Item{Id: "foo", Body: `he said "hi"`}
 	require.NoError(t, store.Put(ctx, "foo", value))
 
-	data := getStoredData(t, client, ctx)
-	stored := data["kvstore-test-foo"]
+	stored := getKeyStoredValue(t, client, ctx, "foo")
 	plain := marshalItem(t, value)
 
 	// the stored value is a json string value wrapping the plain marshaled
@@ -201,7 +197,7 @@ func TestConfigMapKvStore_Integration_JsonEncoding(t *testing.T) {
 	require.NoError(t, err)
 
 	_, store2, _ := buildIntegrationConfigMapStore[Item](t, settings, map[string]string{
-		"kvstore-test-foo": string(seededJSON),
+		"foo": string(seededJSON),
 	})
 
 	found, err = store2.Get(ctx, "foo", item)
@@ -222,8 +218,7 @@ func TestConfigMapKvStore_Integration_CsvEncoding(t *testing.T) {
 	value := Item{Id: "csv", Body: `He said "hi", ok`}
 	require.NoError(t, store.Put(ctx, "csv", value))
 
-	data := getStoredData(t, client, ctx)
-	stored := data["kvstore-test-csv"]
+	stored := getKeyStoredValue(t, client, ctx, "csv")
 	plain := marshalItem(t, value)
 
 	// the stored value is not the plain value and parses as a single-row
@@ -245,10 +240,10 @@ func TestConfigMapKvStore_Integration_CsvEncoding(t *testing.T) {
 	assert.True(t, found)
 	assert.Equal(t, value, *item)
 
-	// a foreign multi-field entry in the same configmap is rejected on read,
+	// a foreign multi-field entry in the key's configmap is rejected on read,
 	// not silently misread
 	_, store2, _ := buildIntegrationConfigMapStore[Item](t, settings, map[string]string{
-		"kvstore-test-foreign": `a,b`,
+		"foreign": `a,b`,
 	})
 
 	_, err = store2.Get(ctx, "foreign", &Item{})
@@ -302,7 +297,7 @@ func TestConfigMapKvStore_Integration_RoundTrip(t *testing.T) {
 			}
 
 			// a second store instance with the same settings and a shared
-			// (fake) client reads the same data back from the same ConfigMap
+			// (fake) client reads the same data back from the same ConfigMaps
 			_, store2, _ := buildIntegrationConfigMapStoreWithClient[Item](t, settings, nil, client)
 
 			item := &Item{}
