@@ -1084,29 +1084,29 @@ func (s *configMapKvStore[T]) countConfigMaps(ctx context.Context) (int64, error
 
 // readKey reads the stored value of the given key from its dedicated
 // ConfigMap. A key whose ConfigMap does not exist yet is reported as missing
-// (ok false, no error) so an absent key is never treated as a store error.
-func (s *configMapKvStore[T]) readKey(ctx context.Context, keyStr string) (string, bool, error) {
+// (found false, no error) so an absent key is never treated as a store error.
+func (s *configMapKvStore[T]) readKey(ctx context.Context, keyStr string) (raw string, found bool, err error) {
 	name := s.configMapName(keyStr)
 
-	configMap, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
+	configMap, getErr := s.client.CoreV1().ConfigMaps(s.namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(getErr) {
 		return "", false, nil
 	}
 
-	if err != nil {
-		return "", false, fmt.Errorf("can not get configmap %s/%s: %w", s.namespace, name, err)
+	if getErr != nil {
+		return "", false, fmt.Errorf("can not get configmap %s/%s: %w", s.namespace, name, getErr)
 	}
 
 	if configMap.Data == nil {
 		return "", false, nil
 	}
 
-	raw, ok := configMap.Data[s.dataKey(keyStr)]
+	value, ok := configMap.Data[s.dataKey(keyStr)]
 	if !ok {
 		return "", false, nil
 	}
 
-	return raw, true, nil
+	return value, true, nil
 }
 
 // writeKey stores the given encoded value under the given key in its
