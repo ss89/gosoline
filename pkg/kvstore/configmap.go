@@ -47,6 +47,16 @@ package kvstore
 // A key's ConfigMap is created on first write. Reads and existence checks
 // against a key whose ConfigMap does not exist yet report the key as missing
 // (false), and deleting a key removes its ConfigMap.
+//
+// # Namespace
+//
+// The store's ConfigMaps live in the namespace the application currently runs
+// in: inside a pod that is the pod's namespace, read from the namespace file
+// of the mounted service account (the same service account the in cluster
+// client authenticates with); outside a pod it is the namespace of the
+// kubeconfig's current context. An explicit namespace in the store
+// configuration overrides the resolved one, so a store can also target any
+// other namespace the service account (or kubeconfig) user has access to.
 
 import (
 	"bytes"
@@ -56,6 +66,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -527,6 +538,12 @@ func csvDecodeString(raw string) ([]byte, error) {
 }
 
 // ConfigMapSettings carries the settings of a ConfigMap backed KvStore.
+//
+// Namespace is the namespace the store's ConfigMaps live in. It is resolved
+// at store creation: the namespace the application currently runs in (the pod
+// namespace of the service account in cluster, the kubeconfig's current
+// context namespace outside a pod), with an explicit namespace from the store
+// configuration taking precedence.
 type ConfigMapSettings struct {
 	Namespace   string
 	StoreName   string
@@ -537,13 +554,17 @@ type ConfigMapSettings struct {
 
 // ConfigMapConfiguration is the configurable representation of the ConfigMap
 // backed KvStore settings, loaded from the "configmap" section of a kvstore's
-// configuration block. Namespace defaults to "default" when not set.
-// Compression and Encoding use value types (the configurable store only
-// populates value, not pointer, nested structs); the NewConfigMapKvStore
-// factory turns them into the nil-means-disabled pointer settings of
-// ConfigMapSettings based on their Enabled flag.
+// configuration block. Compression and Encoding use value types (the
+// configurable store only populates value, not pointer, nested structs); the
+// NewConfigMapKvStore factory turns them into the nil-means-disabled pointer
+// settings of ConfigMapSettings based on their Enabled flag.
+//
+// Namespace is the namespace the store's ConfigMaps live in. When empty the
+// store uses the namespace the application currently runs in (see
+// ConfigMapSettings.Namespace), so the setting is optional and only needed to
+// override that default.
 type ConfigMapConfiguration struct {
-	Namespace   string              `cfg:"namespace" default:"default"`
+	Namespace   string              `cfg:"namespace"`
 	Compression CompressionSettings `cfg:"compression"`
 	Encoding    EncodingSettings    `cfg:"encoding"`
 }
@@ -584,6 +605,10 @@ type configMapKvStore[T any] struct {
 // The store name is taken from the kvstore name itself. Like the other
 // element factories it returns the store wrapped in a metrics store when
 // metrics are enabled on the passed settings.
+//
+// The store's namespace is resolved from the environment: an explicit
+// namespace in the store configuration wins; otherwise the namespace the
+// application currently runs in is used (see resolveKubernetesNamespace).
 func NewConfigMapKvStore[T any](ctx context.Context, config cfg.Config, logger log.Logger, settings *Settings) (KvStore[T], error) {
 	if reflect.ValueOf(new(T)).Elem().Kind() == reflect.Pointer {
 		return nil, fmt.Errorf("the generic type T should not be a pointer type but is of type %T", *new(T))
@@ -599,7 +624,12 @@ func NewConfigMapKvStore[T any](ctx context.Context, config cfg.Config, logger l
 		return nil, fmt.Errorf("can not create kubernetes client for configmap kvstore %s: %w", settings.Name, err)
 	}
 
-	store, err := NewConfigMapKvStoreWithClient[T](client, configuration.Namespace, settings.Name, configuration.toSettings(settings.Name, settings.BatchSize))
+	namespace, err := resolveKubernetesNamespace(ctx, logger, settings.Name, configuration.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("can not resolve namespace for configmap kvstore %s: %w", settings.Name, err)
+	}
+
+	store, err := NewConfigMapKvStoreWithClient[T](client, namespace, settings.Name, configuration.toSettings(settings.Name, settings.BatchSize))
 	if err != nil {
 		return nil, err
 	}
@@ -637,6 +667,45 @@ func provideKubernetesClient(ctx context.Context, _ cfg.Config, logger log.Logge
 	})
 }
 
+// kubernetesServiceAccountDir is the directory the kubernetes service
+// account of a pod is mounted in. The namespace file in it carries the pod's
+// namespace; the token file in it is the same token rest.InClusterConfig
+// uses, so a readable namespace file is a reliable in-cluster signal.
+const kubernetesServiceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+// serviceAccountNamespaceFile is the path of the pod namespace file of the
+// mounted service account. It is a variable so tests can point it at a
+// temporary file.
+var serviceAccountNamespaceFile = kubernetesServiceAccountDir + "/namespace"
+
+// namespaceResolver resolves the namespace a ConfigMap backed KvStore should
+// use. It is a variable so tests can replace it; by default it reads the
+// in-cluster service account namespace and falls back to the kubeconfig's
+// current context namespace.
+var namespaceResolver = resolveNamespaceFromFilesystem
+
+// resolveNamespaceFromFilesystem returns the namespace the application
+// currently runs in: the pod namespace from the mounted service account when
+// running inside a pod, the namespace of the kubeconfig's current context
+// otherwise. It returns an error when neither source can provide a
+// namespace, so a store is never silently created against a guessed
+// namespace.
+func resolveNamespaceFromFilesystem() (string, error) {
+	if data, err := os.ReadFile(serviceAccountNamespaceFile); err == nil {
+		if namespace := strings.TrimSpace(string(data)); namespace != "" {
+			return namespace, nil
+		}
+	}
+
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
+	namespace, _, err := clientConfig.Namespace()
+	if err != nil {
+		return "", fmt.Errorf("can not determine current namespace: no in-cluster service account namespace and %w", err)
+	}
+
+	return namespace, nil
+}
+
 // restConfigFromKubeconfig builds a rest config from the standard kubeconfig
 // loading rules.
 func restConfigFromKubeconfig() (*rest.Config, error) {
@@ -644,6 +713,35 @@ func restConfigFromKubeconfig() (*rest.Config, error) {
 	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
 
 	return clientConfig.ClientConfig()
+}
+
+// resolveKubernetesNamespace determines the namespace the ConfigMap backed
+// KvStore for the given store uses: an explicit configured namespace wins,
+// otherwise the namespace the application currently runs in is resolved
+// (cached in the app context, see provideKubernetesClient for the client
+// cache).
+func resolveKubernetesNamespace(ctx context.Context, logger log.Logger, name, configured string) (string, error) {
+	if configured != "" {
+		logger.Debug(ctx, "configmap kvstore %s uses the configured namespace %s", name, configured)
+
+		return configured, nil
+	}
+
+	namespace, err := appctx.Provide(ctx, "kvstore.configmap.namespace", func() (string, error) {
+		namespace, err := namespaceResolver()
+		if err != nil {
+			return "", err
+		}
+
+		logger.Debug(ctx, "configmap kvstore %s uses the resolved namespace %s", name, namespace)
+
+		return namespace, nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return namespace, nil
 }
 
 // NewConfigMapKvStoreWithClient creates a ConfigMap backed KvStore for the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/justtrackio/gosoline/pkg/appctx"
 	"github.com/justtrackio/gosoline/pkg/cfg"
 	"github.com/justtrackio/gosoline/pkg/log"
 	"github.com/justtrackio/gosoline/pkg/mdl"
@@ -86,22 +87,25 @@ func TestNewConfigMapKvStore_Config(t *testing.T) {
 func TestNewConfigMapKvStore_ConfigDefaults(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	overrideKubernetesClient(t, client)
+	overrideNamespaceResolver(t, "resolved-ns")
 
-	// no configmap section at all: defaults apply, no compression or encoding
+	// no configmap section at all: the store uses the namespace the
+	// application currently runs in (faked to "resolved-ns"), no compression
+	// or encoding
 	config := cfg.New(map[string]any{
 		"kvstore": map[string]any{
 			"mystore": map[string]any{},
 		},
 	})
 
-	store, err := NewConfigMapKvStore[configMapConfigurableItem](t.Context(), config, log.NewLogger(), &Settings{
+	store, err := NewConfigMapKvStore[configMapConfigurableItem](appctx.WithContainer(t.Context()), config, log.NewLogger(), &Settings{
 		ModelId: mdl.ModelId{Name: "mystore"},
 	})
 	require.NoError(t, err)
 
 	require.NoError(t, store.Put(t.Context(), "foo", configMapConfigurableItem{Name: "bar", Age: 1}))
 
-	cm, err := client.CoreV1().ConfigMaps("default").Get(t.Context(), "kvstore-mystore-foo", metav1.GetOptions{})
+	cm, err := client.CoreV1().ConfigMaps("resolved-ns").Get(t.Context(), "kvstore-mystore-foo", metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, `{"name":"bar","age":1}`, cm.Data["foo"])
 }
@@ -127,20 +131,6 @@ func TestConfigMapConfiguration_Unmarshal(t *testing.T) {
 	assert.True(t, configuration.Encoding.Enabled)
 	assert.Equal(t, ConfigMapEncodingJSON, configuration.Encoding.Format)
 	assert.False(t, configuration.Compression.Enabled)
-}
-
-func TestConfigMapConfiguration_NamespaceDefault(t *testing.T) {
-	config := cfg.New(map[string]any{
-		"kvstore": map[string]any{
-			"mystore": map[string]any{
-				"configmap": map[string]any{},
-			},
-		},
-	})
-
-	configuration := ConfigMapConfiguration{}
-	require.NoError(t, config.UnmarshalKey("kvstore.mystore.configmap", &configuration))
-	assert.Equal(t, "default", configuration.Namespace)
 }
 
 func TestNewConfigurableKvStore_ChainWithConfigMapElement(t *testing.T) {
